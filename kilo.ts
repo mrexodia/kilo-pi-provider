@@ -1,7 +1,7 @@
 /**
  * Kilo Provider Extension
  *
- * Provides access to 500+ AI models via the Kilo Gateway (OpenRouter-compatible).
+ * Provides access to 300+ AI models via the Kilo Gateway (OpenRouter-compatible).
  * Uses device code flow for browser-based authentication.
  *
  * Usage:
@@ -10,14 +10,12 @@
  */
 
 import type {
+  Api,
+  Model,
   OAuthCredentials,
   OAuthLoginCallbacks,
 } from "@mariozechner/pi-ai";
-import type {
-  ExtensionAPI,
-  ExtensionContext,
-  ProviderModelConfig,
-} from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ProviderModelConfig } from "@mariozechner/pi-coding-agent";
 
 // =============================================================================
 // Constants
@@ -293,7 +291,15 @@ const KILO_PROVIDER_CONFIG = {
 
 export default async function (pi: ExtensionAPI) {
   // Fetch free models at load time so the provider is immediately usable.
-  const freeModels = await fetchKiloModels({ freeOnly: true });
+  let freeModels: ProviderModelConfig[] = [];
+  try {
+    freeModels = await fetchKiloModels({ freeOnly: true });
+  } catch (error) {
+    console.warn(
+      "[kilo] Failed to fetch free models at startup:",
+      error instanceof Error ? error.message : error,
+    );
+  }
 
   // Full model list cached after login or session_start (when already logged in).
   // Used by modifyModels to upgrade the free list without an async fetch.
@@ -306,9 +312,14 @@ export default async function (pi: ExtensionAPI) {
         const cred = await loginKilo(callbacks);
         // Cache full models so modifyModels can use them during the
         // modelRegistry.refresh() that runs right after login returns.
-        cachedAllModels = await fetchKiloModels({ token: cred.access }).catch(
-          () => [],
-        );
+        try {
+          cachedAllModels = await fetchKiloModels({ token: cred.access });
+        } catch (error) {
+          console.warn(
+            "[kilo] Failed to fetch models after login:",
+            error instanceof Error ? error.message : error,
+          );
+        }
         return cred;
       },
       refreshToken: refreshKiloToken,
@@ -316,12 +327,12 @@ export default async function (pi: ExtensionAPI) {
       // Called by modelRegistry.refresh() when credentials exist.
       // After logout, credentials are removed so this won't be called,
       // leaving only the free models from config.models.
-      modifyModels: (models: any[], _cred: OAuthCredentials) => {
+      modifyModels: (models: Model<Api>[], _cred: OAuthCredentials) => {
         if (cachedAllModels.length === 0) return models;
         // Use an existing kilo model as a template for provider metadata
-        const template = models.find((m: any) => m.provider === "kilo");
+        const template = models.find((m) => m.provider === "kilo");
         if (!template) return models;
-        const nonKilo = models.filter((m: any) => m.provider !== "kilo");
+        const nonKilo = models.filter((m) => m.provider !== "kilo");
         const fullModels = cachedAllModels.map((m) => ({
           ...template,
           id: m.id,
@@ -351,9 +362,15 @@ export default async function (pi: ExtensionAPI) {
     const cred = ctx.modelRegistry.authStorage.get("kilo");
     if (cred?.type !== "oauth") return;
 
-    cachedAllModels = await fetchKiloModels({ token: cred.access }).catch(
-      () => [],
-    );
+    try {
+      cachedAllModels = await fetchKiloModels({ token: cred.access });
+    } catch (error) {
+      console.warn(
+        "[kilo] Failed to fetch models at session start:",
+        error instanceof Error ? error.message : error,
+      );
+      return;
+    }
     if (cachedAllModels.length > 0) {
       // Re-register to trigger modifyModels with the cached data.
       ctx.modelRegistry.registerProvider("kilo", {
