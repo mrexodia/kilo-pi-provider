@@ -1,0 +1,14 @@
+{
+  "name": "kilo-pi-provider",
+  "version": "1.0.0",
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "BSL-1.0",
+  "pi": {
+    "extensions": [
+      "./kilo.ts"
+    ]
+  }
+}
