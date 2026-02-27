@@ -197,7 +197,14 @@ function parsePrice(price: string | null | undefined): number {
 function isFreeModel(m: OpenRouterModel): boolean {
   const prompt = parseFloat(m.pricing?.prompt ?? "1");
   const completion = parseFloat(m.pricing?.completion ?? "1");
-  return prompt === 0 && completion === 0;
+  if (prompt !== 0 || completion !== 0) return false;
+  // Zero pricing alone isn't reliable (some models report "0" but require auth).
+  // Use the :free suffix (OpenRouter convention), Kilo-native models (no vendor
+  // prefix), or known Kilo/OpenRouter free routers.
+  if (m.id.includes(":free")) return true;
+  if (!m.id.includes("/")) return true;
+  if (m.id.startsWith("kilo/") || m.id.startsWith("openrouter/")) return true;
+  return false;
 }
 
 function mapOpenRouterModel(m: OpenRouterModel): ProviderModelConfig {
@@ -274,7 +281,6 @@ const KILO_PROVIDER_CONFIG = {
   baseUrl: KILO_GATEWAY_BASE,
   apiKey: "KILO_API_KEY",
   api: "openai-completions" as const,
-  authHeader: true,
   headers: {
     "X-KILOCODE-EDITORNAME": "Pi",
     "User-Agent": "pi-kilo-provider",
@@ -289,29 +295,71 @@ export default async function (pi: ExtensionAPI) {
   // Fetch free models at load time so the provider is immediately usable.
   const freeModels = await fetchKiloModels({ freeOnly: true });
 
+  // Full model list cached after login or session_start (when already logged in).
+  // Used by modifyModels to upgrade the free list without an async fetch.
+  let cachedAllModels: ProviderModelConfig[] = [];
+
+  function makeOAuthConfig() {
+    return {
+      name: "Kilo",
+      login: async (callbacks: OAuthLoginCallbacks) => {
+        const cred = await loginKilo(callbacks);
+        // Cache full models so modifyModels can use them during the
+        // modelRegistry.refresh() that runs right after login returns.
+        cachedAllModels = await fetchKiloModels({ token: cred.access }).catch(
+          () => [],
+        );
+        return cred;
+      },
+      refreshToken: refreshKiloToken,
+      getApiKey: (cred: OAuthCredentials) => cred.access,
+      // Called by modelRegistry.refresh() when credentials exist.
+      // After logout, credentials are removed so this won't be called,
+      // leaving only the free models from config.models.
+      modifyModels: (models: any[], _cred: OAuthCredentials) => {
+        if (cachedAllModels.length === 0) return models;
+        // Use an existing kilo model as a template for provider metadata
+        const template = models.find((m: any) => m.provider === "kilo");
+        if (!template) return models;
+        const nonKilo = models.filter((m: any) => m.provider !== "kilo");
+        const fullModels = cachedAllModels.map((m) => ({
+          ...template,
+          id: m.id,
+          name: m.name,
+          reasoning: m.reasoning,
+          input: m.input,
+          cost: m.cost,
+          contextWindow: m.contextWindow,
+          maxTokens: m.maxTokens,
+        }));
+        return [...nonKilo, ...fullModels];
+      },
+    };
+  }
+
+  // Always register with free models. modifyModels upgrades to full list
+  // when credentials exist, and naturally falls back after logout.
   pi.registerProvider("kilo", {
     ...KILO_PROVIDER_CONFIG,
     models: freeModels,
-    oauth: {
-      name: "Kilo",
-      login: loginKilo,
-      refreshToken: refreshKiloToken,
-      getApiKey: (cred) => cred.access,
-    },
+    oauth: makeOAuthConfig(),
   });
 
-  // After session starts, upgrade to all models if logged in.
+  // After session starts, pre-fetch all models if already logged in so
+  // modifyModels has data to work with.
   pi.on("session_start", async (_event, ctx) => {
     const cred = ctx.modelRegistry.authStorage.get("kilo");
     if (cred?.type !== "oauth") return;
 
-    const models = await fetchKiloModels({ token: cred.access }).catch(
+    cachedAllModels = await fetchKiloModels({ token: cred.access }).catch(
       () => [],
     );
-    if (models.length > 0) {
+    if (cachedAllModels.length > 0) {
+      // Re-register to trigger modifyModels with the cached data.
       ctx.modelRegistry.registerProvider("kilo", {
         ...KILO_PROVIDER_CONFIG,
-        models,
+        models: freeModels,
+        oauth: makeOAuthConfig(),
       });
     }
   });
