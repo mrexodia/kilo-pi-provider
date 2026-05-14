@@ -9,6 +9,9 @@
  *   # Then /login kilo, or set KILO_API_KEY=...
  */
 
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type {
   Api,
   Model,
@@ -30,22 +33,137 @@ const MODELS_FETCH_TIMEOUT_MS = 10_000;
 const TOKEN_EXPIRATION_MS = 365 * 24 * 60 * 60 * 1000; // 1 year
 const KILO_TOS_URL = "https://kilo.ai/terms";
 const KILO_PROFILE_ENDPOINT = `${KILO_API_BASE}/api/profile`;
+const KILO_ORG_HEADER = "X-KiloCode-OrganizationId";
+
+function getEnvOrganizationId(): string | undefined {
+  return process.env.KILO_ORG_ID || process.env.KILOCODE_ORGANIZATION_ID;
+}
+
+function getAgentDir(): string {
+  return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+}
+
+function readStoredKiloCredentials(): OAuthCredentials | undefined {
+  try {
+    const authPath = join(getAgentDir(), "auth.json");
+    if (!existsSync(authPath)) return undefined;
+    const auth = JSON.parse(readFileSync(authPath, "utf8")) as {
+      kilo?: { type?: string } & OAuthCredentials;
+    };
+    const cred = auth.kilo;
+    if (cred?.type !== "oauth" || !cred.access) return undefined;
+    return cred;
+  } catch {
+    return undefined;
+  }
+}
+
+function getCredentialOrganizationId(credentials?: OAuthCredentials): string | undefined {
+  const accountId = credentials?.accountId;
+  return typeof accountId === "string" && accountId.trim() ? accountId : undefined;
+}
+
+function getEffectiveOrganizationId(credentials?: OAuthCredentials): string | undefined {
+  return getCredentialOrganizationId(credentials) ?? getEnvOrganizationId();
+}
+
+function withOrganizationHeader(
+  headers: Record<string, string>,
+  organizationId?: string,
+): Record<string, string> {
+  if (!organizationId) return headers;
+  return { ...headers, [KILO_ORG_HEADER]: organizationId };
+}
 
 // =============================================================================
-// Balance Fetching
+// Profile and Balance Fetching
 // =============================================================================
+
+interface KiloOrganization {
+  id: string;
+  name: string;
+  role?: string;
+}
+
+interface KiloProfile {
+  user?: { email?: string; name?: string };
+  email?: string;
+  name?: string;
+  organizations?: KiloOrganization[];
+}
 
 interface KiloBalance {
   balance?: number;
 }
 
-async function fetchKiloBalance(token: string): Promise<number | null> {
+async function fetchKiloProfile(token: string): Promise<KiloProfile> {
+  const response = await fetch(KILO_PROFILE_ENDPOINT, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch Kilo profile: ${response.status}`);
+  }
+
+  return (await response.json()) as KiloProfile;
+}
+
+async function selectKiloOrganization(
+  token: string,
+  callbacks: OAuthLoginCallbacks,
+): Promise<string | undefined> {
+  let profile: KiloProfile;
+  try {
+    callbacks.onProgress?.("Fetching Kilo profile...");
+    profile = await fetchKiloProfile(token);
+  } catch (error) {
+    console.warn(
+      "[kilo] Failed to fetch profile for organization selection:",
+      error instanceof Error ? error.message : error,
+    );
+    return getEnvOrganizationId();
+  }
+
+  const organizations = profile.organizations ?? [];
+  const envOrganizationId = getEnvOrganizationId();
+  if (envOrganizationId && organizations.some((org) => org.id === envOrganizationId)) {
+    return envOrganizationId;
+  }
+  if (!callbacks.onSelect || organizations.length === 0) {
+    return envOrganizationId;
+  }
+
+  const selected = await callbacks.onSelect({
+    message: "Select Kilo account",
+    options: [
+      { id: "personal", label: "Personal Account" },
+      ...organizations.map((org) => ({
+        id: org.id,
+        label: `${org.name}${org.role ? ` (${org.role})` : ""}`,
+      })),
+    ],
+  });
+
+  if (!selected || selected === "personal") return undefined;
+  return selected;
+}
+
+async function fetchKiloBalance(
+  token: string,
+  organizationId?: string,
+): Promise<number | null> {
   try {
     const response = await fetch(`${KILO_PROFILE_ENDPOINT}/balance`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
+      headers: withOrganizationHeader(
+        {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        organizationId,
+      ),
     });
 
     if (!response.ok) {
@@ -164,10 +282,12 @@ async function loginKilo(
         throw new Error("Authorization approved but no token received");
       }
       callbacks.onProgress?.("Login successful!");
+      const organizationId = await selectKiloOrganization(result.token, callbacks);
       return {
         refresh: result.token,
         access: result.token,
         expires: Date.now() + TOKEN_EXPIRATION_MS,
+        ...(organizationId ? { accountId: organizationId } : {}),
       };
     }
 
@@ -305,6 +425,7 @@ function mapOpenRouterModel(m: OpenRouterModel): ProviderModelConfig {
 
 async function fetchKiloModels(options?: {
   token?: string;
+  organizationId?: string;
   freeOnly?: boolean;
 }): Promise<ProviderModelConfig[]> {
   const headers: Record<string, string> = {
@@ -314,9 +435,14 @@ async function fetchKiloModels(options?: {
   if (options?.token) {
     headers.Authorization = `Bearer ${options.token}`;
   }
+  const organizationId = options?.organizationId;
+  const requestHeaders = withOrganizationHeader(headers, organizationId);
+  const modelsUrl = organizationId
+    ? `${KILO_API_BASE}/api/organizations/${encodeURIComponent(organizationId)}/models`
+    : `${KILO_GATEWAY_BASE}/models`;
 
-  const response = await fetch(`${KILO_GATEWAY_BASE}/models`, {
-    headers,
+  const response = await fetch(modelsUrl, {
+    headers: requestHeaders,
     signal: AbortSignal.timeout(MODELS_FETCH_TIMEOUT_MS),
   });
 
@@ -357,25 +483,46 @@ const KILO_PROVIDER_CONFIG = {
   },
 };
 
+function makeProviderConfig(organizationId?: string) {
+  return {
+    ...KILO_PROVIDER_CONFIG,
+    headers: withOrganizationHeader(KILO_PROVIDER_CONFIG.headers, organizationId),
+  };
+}
+
 // =============================================================================
 // Extension Entry Point
 // =============================================================================
 
 export default async function (pi: ExtensionAPI) {
-  // Fetch free models at load time so the provider is immediately usable.
+  const storedCredentials = readStoredKiloCredentials();
+  const startupOrganizationId = getEffectiveOrganizationId(storedCredentials);
+
+  // Fetch models at load time so the provider is immediately usable for
+  // --list-models, --model selection, and print mode before session_start fires.
   let freeModels: ProviderModelConfig[] = [];
+  let cachedAllModels: ProviderModelConfig[] = [];
   try {
-    freeModels = await fetchKiloModels({ freeOnly: true });
+    if (storedCredentials?.access) {
+      cachedAllModels = await fetchKiloModels({
+        token: storedCredentials.access,
+        organizationId: startupOrganizationId,
+      });
+      freeModels = cachedAllModels.length > 0 ? cachedAllModels : [];
+    } else {
+      freeModels = await fetchKiloModels({ freeOnly: true });
+    }
   } catch (error) {
     console.warn(
-      "[kilo] Failed to fetch free models at startup:",
+      "[kilo] Failed to fetch models at startup:",
       error instanceof Error ? error.message : error,
     );
+    if (freeModels.length === 0) {
+      try {
+        freeModels = await fetchKiloModels({ freeOnly: true });
+      } catch {}
+    }
   }
-
-  // Full model list cached after login or session_start (when already logged in).
-  // Used by modifyModels to upgrade the free list without an async fetch.
-  let cachedAllModels: ProviderModelConfig[] = [];
 
   function makeOAuthConfig() {
     return {
@@ -385,7 +532,8 @@ export default async function (pi: ExtensionAPI) {
         // Cache full models so modifyModels can use them during the
         // modelRegistry.refresh() that runs right after login returns.
         try {
-          cachedAllModels = await fetchKiloModels({ token: cred.access });
+          const organizationId = getEffectiveOrganizationId(cred);
+          cachedAllModels = await fetchKiloModels({ token: cred.access, organizationId });
         } catch (error) {
           console.warn(
             "[kilo] Failed to fetch models after login:",
@@ -399,8 +547,10 @@ export default async function (pi: ExtensionAPI) {
       // Called by modelRegistry.refresh() when credentials exist.
       // After logout, credentials are removed so this won't be called,
       // leaving only the free models from config.models.
-      modifyModels: (models: Model<Api>[], _cred: OAuthCredentials) => {
+      modifyModels: (models: Model<Api>[], cred: OAuthCredentials) => {
         if (cachedAllModels.length === 0) return models;
+        const organizationId = getEffectiveOrganizationId(cred);
+        const orgHeaders = organizationId ? { [KILO_ORG_HEADER]: organizationId } : undefined;
         // Use an existing kilo model as a template for provider metadata
         const template = models.find((m) => m.provider === "kilo");
         if (!template) return models;
@@ -414,6 +564,7 @@ export default async function (pi: ExtensionAPI) {
           cost: m.cost,
           contextWindow: m.contextWindow,
           maxTokens: m.maxTokens,
+          headers: orgHeaders,
           compat: m.compat,
         }));
         return [...nonKilo, ...fullModels];
@@ -424,7 +575,7 @@ export default async function (pi: ExtensionAPI) {
   // Always register with free models. modifyModels upgrades to full list
   // when credentials exist, and naturally falls back after logout.
   pi.registerProvider("kilo", {
-    ...KILO_PROVIDER_CONFIG,
+    ...makeProviderConfig(getEnvOrganizationId()),
     models: freeModels,
     oauth: makeOAuthConfig(),
   });
@@ -441,7 +592,10 @@ export default async function (pi: ExtensionAPI) {
     }
 
     try {
-      cachedAllModels = await fetchKiloModels({ token: cred.access });
+      cachedAllModels = await fetchKiloModels({
+        token: cred.access,
+        organizationId: getEffectiveOrganizationId(cred),
+      });
     } catch (error) {
       console.warn(
         "[kilo] Failed to fetch models at session start:",
@@ -452,7 +606,7 @@ export default async function (pi: ExtensionAPI) {
     if (cachedAllModels.length > 0) {
       // Re-register to trigger modifyModels with the cached data.
       ctx.modelRegistry.registerProvider("kilo", {
-        ...KILO_PROVIDER_CONFIG,
+        ...makeProviderConfig(getEffectiveOrganizationId(cred)),
         models: freeModels,
         oauth: makeOAuthConfig(),
       });
@@ -460,7 +614,7 @@ export default async function (pi: ExtensionAPI) {
 
     // Fetch and display credits balance
     try {
-      const balance = await fetchKiloBalance(cred.access);
+      const balance = await fetchKiloBalance(cred.access, getEffectiveOrganizationId(cred));
       if (balance !== null) {
         const theme = ctx.ui.theme;
         ctx.ui.setStatus(
@@ -484,7 +638,7 @@ export default async function (pi: ExtensionAPI) {
     if (cred?.type !== "oauth") return;
 
     try {
-      const balance = await fetchKiloBalance(cred.access);
+      const balance = await fetchKiloBalance(cred.access, getEffectiveOrganizationId(cred));
       if (balance !== null) {
         const theme = ctx.ui.theme;
         ctx.ui.setStatus(
@@ -506,7 +660,7 @@ export default async function (pi: ExtensionAPI) {
     if (cred?.type !== "oauth") return;
 
     try {
-      const balance = await fetchKiloBalance(cred.access);
+      const balance = await fetchKiloBalance(cred.access, getEffectiveOrganizationId(cred));
       if (balance !== null) {
         const theme = ctx.ui.theme;
         ctx.ui.setStatus(
