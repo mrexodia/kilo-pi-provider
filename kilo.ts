@@ -220,6 +220,21 @@ interface OpenRouterModel {
   };
   top_provider?: { max_completion_tokens?: number | null };
   supported_parameters?: string[];
+  opencode?: {
+    family?: string;
+    prompt?: string;
+    variants?: Record<
+      string,
+      {
+        reasoning?: {
+          enabled?: boolean;
+          effort?: string;
+        };
+        verbosity?: string;
+      }
+    >;
+    ai_sdk_provider?: string;
+  };
 }
 
 function parsePrice(price: string | null | undefined): number {
@@ -244,21 +259,23 @@ function isFreeModel(m: OpenRouterModel): boolean {
   return false;
 }
 
-type KiloReasoningLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
+type PiThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
 type KiloModelCompat = {
+  thinkingFormat?: "openrouter";
   cacheControlFormat?: "anthropic";
   requiresReasoningContentOnAssistantMessages?: boolean;
-  reasoningEffortMap?: Partial<Record<KiloReasoningLevel, string>>;
+  supportsStore?: boolean;
 };
 
-function getKiloModelCompat(
-  m: OpenRouterModel,
-): ProviderModelConfig["compat"] | undefined {
-  const compat: KiloModelCompat = {};
+function getKiloModelCompat(m: OpenRouterModel): ProviderModelConfig["compat"] {
+  const compat: KiloModelCompat = {
+    // Kilo's gateway is OpenRouter-compatible, but it uses api.kilo.ai so
+    // pi-ai's URL/provider auto-detection cannot infer OpenRouter model quirks.
+    thinkingFormat: "openrouter",
+    supportsStore: false,
+  };
 
-  // Kilo's gateway is OpenRouter-compatible, but it uses api.kilo.ai so
-  // pi-ai's URL/provider auto-detection cannot infer OpenRouter model quirks.
   if (m.id.startsWith("anthropic/")) {
     compat.cacheControlFormat = "anthropic";
   }
@@ -267,13 +284,75 @@ function getKiloModelCompat(
     compat.requiresReasoningContentOnAssistantMessages = true;
   }
 
-  if (m.id === "deepseek/deepseek-v4-pro") {
-    compat.reasoningEffortMap = { xhigh: "max" };
+  return compat as ProviderModelConfig["compat"];
+}
+
+function mapVariantEffort(
+  variants: NonNullable<OpenRouterModel["opencode"]>["variants"],
+  key: string,
+): string | undefined {
+  const variant = variants?.[key];
+  if (!variant) return undefined;
+  const reasoning = variant.reasoning;
+  if (!reasoning) return key;
+  if (reasoning.enabled === false || reasoning.effort === "none") return "none";
+  return reasoning.effort ?? key;
+}
+
+function thinkingLevelMapFromVariants(
+  variants: NonNullable<OpenRouterModel["opencode"]>["variants"],
+): ProviderModelConfig["thinkingLevelMap"] | undefined {
+  if (!variants || Object.keys(variants).length === 0) return undefined;
+
+  const map: Partial<Record<PiThinkingLevel, string | null>> = {};
+  const off = mapVariantEffort(variants, "none") ?? mapVariantEffort(variants, "instant");
+  if (off !== undefined) map.off = off;
+
+  for (const level of ["minimal", "low", "medium", "high", "xhigh"] as const) {
+    const effort = mapVariantEffort(variants, level);
+    map[level] = effort === undefined ? null : effort;
   }
 
-  return Object.keys(compat).length > 0
-    ? (compat as ProviderModelConfig["compat"])
-    : undefined;
+  // Pi has no separate "max" thinking level. Expose a Kilo/OpenCode max
+  // variant as Pi's xhigh when xhigh is absent.
+  if (map.xhigh === null) {
+    const max = mapVariantEffort(variants, "max");
+    if (max !== undefined) map.xhigh = max;
+  }
+
+  return map as ProviderModelConfig["thinkingLevelMap"];
+}
+
+function getKiloThinkingLevelMap(
+  m: OpenRouterModel,
+): ProviderModelConfig["thinkingLevelMap"] | undefined {
+  const fromVariants = thinkingLevelMapFromVariants(m.opencode?.variants);
+  if (fromVariants) return fromVariants;
+
+  if (m.id === "deepseek/deepseek-v4-pro") {
+    return {
+      minimal: null,
+      low: null,
+      medium: null,
+      high: "high",
+      xhigh: "max",
+    };
+  }
+
+  // Safety net for the current frontier OpenAI model while Kilo/OpenRouter
+  // model metadata is catching up.
+  if (m.id.includes("gpt-5.5")) {
+    return {
+      off: "none",
+      minimal: null,
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: "xhigh",
+    };
+  }
+
+  return undefined;
 }
 
 function mapOpenRouterModel(m: OpenRouterModel): ProviderModelConfig {
@@ -299,6 +378,7 @@ function mapOpenRouterModel(m: OpenRouterModel): ProviderModelConfig {
     },
     contextWindow: m.context_length,
     maxTokens: maxTokens,
+    thinkingLevelMap: getKiloThinkingLevelMap(m),
     compat: getKiloModelCompat(m),
   };
 }
@@ -414,6 +494,7 @@ export default async function (pi: ExtensionAPI) {
           cost: m.cost,
           contextWindow: m.contextWindow,
           maxTokens: m.maxTokens,
+          thinkingLevelMap: m.thinkingLevelMap,
           compat: m.compat,
         }));
         return [...nonKilo, ...fullModels];
