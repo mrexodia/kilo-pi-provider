@@ -612,21 +612,23 @@ export default async function (pi: ExtensionAPI) {
       });
     }
 
-    // Fetch and display credits balance
-    try {
-      const balance = await fetchKiloBalance(cred.access, getEffectiveOrganizationId(cred));
-      if (balance !== null) {
-        const theme = ctx.ui.theme;
-        ctx.ui.setStatus(
-          "kilo-credits",
-          theme.fg("accent", `💰 ${formatCredits(balance)}`),
+    // Fetch and display credits balance when an interactive UI is available.
+    if (ctx.hasUI) {
+      try {
+        const balance = await fetchKiloBalance(cred.access, getEffectiveOrganizationId(cred));
+        if (balance !== null) {
+          const theme = ctx.ui.theme;
+          ctx.ui.setStatus(
+            "kilo-credits",
+            theme.fg("accent", `💰 ${formatCredits(balance)}`),
+          );
+        }
+      } catch (error) {
+        console.warn(
+          "[kilo] Failed to fetch balance:",
+          error instanceof Error ? error.message : error,
         );
       }
-    } catch (error) {
-      console.warn(
-        "[kilo] Failed to fetch balance:",
-        error instanceof Error ? error.message : error,
-      );
     }
   });
 
@@ -636,6 +638,8 @@ export default async function (pi: ExtensionAPI) {
 
     const cred = ctx.modelRegistry.authStorage.get("kilo");
     if (cred?.type !== "oauth") return;
+
+    if (!ctx.hasUI) return;
 
     try {
       const balance = await fetchKiloBalance(cred.access, getEffectiveOrganizationId(cred));
@@ -658,6 +662,8 @@ export default async function (pi: ExtensionAPI) {
   pi.on("turn_end", async (_event, ctx) => {
     const cred = ctx.modelRegistry.authStorage.get("kilo");
     if (cred?.type !== "oauth") return;
+
+    if (!ctx.hasUI) return;
 
     try {
       const balance = await fetchKiloBalance(cred.access, getEffectiveOrganizationId(cred));
