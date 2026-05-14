@@ -24,6 +24,7 @@ import { visibleWidth } from "@mariozechner/pi-tui";
 
 const KILO_API_BASE = process.env.KILO_API_URL || "https://api.kilo.ai";
 const KILO_GATEWAY_BASE = `${KILO_API_BASE}/api/gateway`;
+const KILO_OPENROUTER_BASE = `${KILO_API_BASE}/api/openrouter`;
 const KILO_DEVICE_AUTH_ENDPOINT = `${KILO_API_BASE}/api/device-auth/codes`;
 const POLL_INTERVAL_MS = 3000;
 const MODELS_FETCH_TIMEOUT_MS = 10_000;
@@ -220,6 +221,9 @@ interface OpenRouterModel {
   };
   top_provider?: { max_completion_tokens?: number | null };
   supported_parameters?: string[];
+  opencode?: {
+    ai_sdk_provider?: string;
+  };
 }
 
 function parsePrice(price: string | null | undefined): number {
@@ -250,11 +254,42 @@ type KiloModelCompat = {
   cacheControlFormat?: "anthropic";
   requiresReasoningContentOnAssistantMessages?: boolean;
   reasoningEffortMap?: Partial<Record<KiloReasoningLevel, string>>;
+  sendSessionIdHeader?: boolean;
+  supportsLongCacheRetention?: boolean;
 };
+
+function shouldUseResponsesApi(m: OpenRouterModel): boolean {
+  const aiSdkProvider = m.opencode?.ai_sdk_provider;
+  if (aiSdkProvider === "openai") return true;
+
+  // Some model metadata may arrive before ai_sdk_provider is populated. KiloCode
+  // routes current OpenAI reasoning/frontier models through the Responses API;
+  // using chat completions for these yields: "please use any of: responses".
+  const id = m.id.toLowerCase();
+  const shortId = id.includes("/") ? id.split("/").pop() ?? id : id;
+  return (
+    shortId === "gpt-5" ||
+    shortId.startsWith("gpt-5.") ||
+    shortId.startsWith("gpt-5-") ||
+    shortId.startsWith("o1") ||
+    shortId.startsWith("o3") ||
+    shortId.startsWith("o4")
+  );
+}
 
 function getKiloModelCompat(
   m: OpenRouterModel,
+  api: Api | undefined,
 ): ProviderModelConfig["compat"] | undefined {
+  if (api === "openai-responses") {
+    return {
+      // Kilo/OpenRouter-compatible responses endpoints do not need OpenAI's
+      // session_id header, and long prompt-cache retention is provider-specific.
+      sendSessionIdHeader: false,
+      supportsLongCacheRetention: false,
+    } as ProviderModelConfig["compat"];
+  }
+
   const compat: KiloModelCompat = {};
 
   // Kilo's gateway is OpenRouter-compatible, but it uses api.kilo.ai so
@@ -285,10 +320,12 @@ function mapOpenRouterModel(m: OpenRouterModel): ProviderModelConfig {
     m.top_provider?.max_completion_tokens ??
     m.max_completion_tokens ??
     Math.ceil(m.context_length * 0.2);
+  const api = shouldUseResponsesApi(m) ? ("openai-responses" as const) : undefined;
 
   return {
     id: m.id,
     name: m.name,
+    ...(api ? { api, baseUrl: KILO_OPENROUTER_BASE } : {}),
     reasoning: supportsReasoning,
     input: supportsImages ? ["text", "image"] : ["text"],
     cost: {
@@ -299,7 +336,7 @@ function mapOpenRouterModel(m: OpenRouterModel): ProviderModelConfig {
     },
     contextWindow: m.context_length,
     maxTokens: maxTokens,
-    compat: getKiloModelCompat(m),
+    compat: getKiloModelCompat(m, api),
   };
 }
 
@@ -409,6 +446,8 @@ export default async function (pi: ExtensionAPI) {
           ...template,
           id: m.id,
           name: m.name,
+          api: m.api ?? template.api,
+          baseUrl: m.baseUrl ?? template.baseUrl,
           reasoning: m.reasoning,
           input: m.input,
           cost: m.cost,
