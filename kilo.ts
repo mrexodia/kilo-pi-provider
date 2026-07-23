@@ -634,9 +634,20 @@ export default async function (pi: ExtensionAPI) {
           }
           statsParts.push(contextPercentStr);
 
-          // Inject credits inline on the main stats line
-          const creditsStatus = footerData.getExtensionStatuses().get("kilo-credits");
+          // Inject extension statuses inline on the main stats line.
+          // Kilo's credits keep their existing position, then any statuses from
+          // other extensions are appended in the same deterministic order used
+          // by Pi's built-in footer.
+          const extensionStatuses = footerData.getExtensionStatuses();
+          const creditsStatus = extensionStatuses.get("kilo-credits");
           if (creditsStatus) statsParts.push(creditsStatus);
+
+          const otherStatuses = Array.from(extensionStatuses.entries())
+            .filter(([key]) => key !== "kilo-credits")
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([, text]) => text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim())
+            .filter((text) => text.length > 0);
+          statsParts.push(...otherStatuses);
 
           let statsLeft = statsParts.join(" ");
           let statsLeftWidth = visibleWidth(statsLeft);
