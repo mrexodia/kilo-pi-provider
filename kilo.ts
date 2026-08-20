@@ -14,9 +14,13 @@ import type {
   Model,
   OAuthCredentials,
   OAuthLoginCallbacks,
-} from "@mariozechner/pi-ai";
-import type { ExtensionAPI, ProviderModelConfig } from "@mariozechner/pi-coding-agent";
-import { visibleWidth } from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-ai";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+  ProviderModelConfig,
+} from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 
 // =============================================================================
 // Constants
@@ -244,18 +248,16 @@ function isFreeModel(m: OpenRouterModel): boolean {
   return false;
 }
 
-type KiloReasoningLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
-
 type KiloModelCompat = {
+  thinkingFormat: "openrouter";
   cacheControlFormat?: "anthropic";
   requiresReasoningContentOnAssistantMessages?: boolean;
-  reasoningEffortMap?: Partial<Record<KiloReasoningLevel, string>>;
 };
 
 function getKiloModelCompat(
   m: OpenRouterModel,
 ): ProviderModelConfig["compat"] | undefined {
-  const compat: KiloModelCompat = {};
+  const compat: KiloModelCompat = { thinkingFormat: "openrouter" };
 
   // Kilo's gateway is OpenRouter-compatible, but it uses api.kilo.ai so
   // pi-ai's URL/provider auto-detection cannot infer OpenRouter model quirks.
@@ -265,10 +267,6 @@ function getKiloModelCompat(
 
   if (m.id === "deepseek/deepseek-v4-flash" || m.id === "deepseek/deepseek-v4-pro") {
     compat.requiresReasoningContentOnAssistantMessages = true;
-  }
-
-  if (m.id === "deepseek/deepseek-v4-pro") {
-    compat.reasoningEffortMap = { xhigh: "max" };
   }
 
   return Object.keys(compat).length > 0
@@ -300,6 +298,9 @@ function mapOpenRouterModel(m: OpenRouterModel): ProviderModelConfig {
     contextWindow: m.context_length,
     maxTokens: maxTokens,
     compat: getKiloModelCompat(m),
+    ...(m.id === "deepseek/deepseek-v4-pro"
+      ? { thinkingLevelMap: { xhigh: "max" } }
+      : {}),
   };
 }
 
@@ -415,6 +416,7 @@ export default async function (pi: ExtensionAPI) {
           contextWindow: m.contextWindow,
           maxTokens: m.maxTokens,
           compat: m.compat,
+          thinkingLevelMap: m.thinkingLevelMap,
         }));
         return [...nonKilo, ...fullModels];
       },
@@ -429,19 +431,27 @@ export default async function (pi: ExtensionAPI) {
     oauth: makeOAuthConfig(),
   });
 
-  // After session starts, pre-fetch all models if already logged in so
-  // modifyModels has data to work with. Also fetch and display credits.
-  pi.on("session_start", async (_event, ctx) => {
-    const cred = ctx.modelRegistry.authStorage.get("kilo");
+  // Resolve the current OAuth token through the public model registry API.
+  async function getKiloOAuthToken(ctx: ExtensionContext): Promise<string | null> {
+    const auth = await ctx.modelRegistry.getProviderAuth("kilo");
+    if (!auth || auth.source !== "OAuth") return null;
+    return auth.auth.apiKey ?? null;
+  }
 
-    // Clear credits if not logged in
-    if (cred?.type !== "oauth") {
+  // After session starts, pre-fetch all models if already logged in so
+  // modifyModels has data to work with. Also fetch and display credits when
+  // the active model is a Kilo model.
+  pi.on("session_start", async (_event, ctx) => {
+    const token = await getKiloOAuthToken(ctx);
+
+    // Clear credits if not logged in or the active model is not Kilo.
+    if (!token || ctx.model?.provider !== "kilo") {
       ctx.ui.setStatus("kilo-credits", undefined);
-      return;
+      if (!token) return;
     }
 
     try {
-      cachedAllModels = await fetchKiloModels({ token: cred.access });
+      cachedAllModels = await fetchKiloModels({ token });
     } catch (error) {
       console.warn(
         "[kilo] Failed to fetch models at session start:",
@@ -460,8 +470,8 @@ export default async function (pi: ExtensionAPI) {
 
     // Fetch and display credits balance
     try {
-      const balance = await fetchKiloBalance(cred.access);
-      if (balance !== null) {
+      const balance = await fetchKiloBalance(token);
+      if (balance !== null && ctx.model?.provider === "kilo") {
         const theme = ctx.ui.theme;
         ctx.ui.setStatus(
           "kilo-credits",
@@ -476,16 +486,22 @@ export default async function (pi: ExtensionAPI) {
     }
   });
 
-  // Update credits display when model changes to a Kilo model
+  // Update or clear credits when the active model changes.
   pi.on("model_select", async (event, ctx) => {
-    if (event.model?.provider !== "kilo") return;
+    if (event.model?.provider !== "kilo") {
+      ctx.ui.setStatus("kilo-credits", undefined);
+      return;
+    }
 
-    const cred = ctx.modelRegistry.authStorage.get("kilo");
-    if (cred?.type !== "oauth") return;
+    const token = await getKiloOAuthToken(ctx);
+    if (!token) {
+      ctx.ui.setStatus("kilo-credits", undefined);
+      return;
+    }
 
     try {
-      const balance = await fetchKiloBalance(cred.access);
-      if (balance !== null) {
+      const balance = await fetchKiloBalance(token);
+      if (balance !== null && ctx.model?.provider === "kilo") {
         const theme = ctx.ui.theme;
         ctx.ui.setStatus(
           "kilo-credits",
@@ -500,14 +516,22 @@ export default async function (pi: ExtensionAPI) {
     }
   });
 
-  // Refresh credits after each turn
+  // Refresh credits after each turn while a Kilo model is active.
   pi.on("turn_end", async (_event, ctx) => {
-    const cred = ctx.modelRegistry.authStorage.get("kilo");
-    if (cred?.type !== "oauth") return;
+    if (ctx.model?.provider !== "kilo") {
+      ctx.ui.setStatus("kilo-credits", undefined);
+      return;
+    }
+
+    const token = await getKiloOAuthToken(ctx);
+    if (!token) {
+      ctx.ui.setStatus("kilo-credits", undefined);
+      return;
+    }
 
     try {
-      const balance = await fetchKiloBalance(cred.access);
-      if (balance !== null) {
+      const balance = await fetchKiloBalance(token);
+      if (balance !== null && ctx.model?.provider === "kilo") {
         const theme = ctx.ui.theme;
         ctx.ui.setStatus(
           "kilo-credits",
@@ -529,8 +553,8 @@ export default async function (pi: ExtensionAPI) {
     if (tosShown) return;
     if (ctx.model?.provider !== "kilo") return;
 
-    const cred = ctx.modelRegistry.authStorage.get("kilo");
-    if (cred?.type === "oauth") {
+    const token = await getKiloOAuthToken(ctx);
+    if (token) {
       tosShown = true;
       return;
     }
