@@ -439,14 +439,15 @@ export default async function (pi: ExtensionAPI) {
   }
 
   // After session starts, pre-fetch all models if already logged in so
-  // modifyModels has data to work with. Also fetch and display credits.
+  // modifyModels has data to work with. Also fetch and display credits when
+  // the active model is a Kilo model.
   pi.on("session_start", async (_event, ctx) => {
     const token = await getKiloOAuthToken(ctx);
 
-    // Clear credits if not logged in
-    if (!token) {
+    // Clear credits if not logged in or the active model is not Kilo.
+    if (!token || ctx.model?.provider !== "kilo") {
       ctx.ui.setStatus("kilo-credits", undefined);
-      return;
+      if (!token) return;
     }
 
     try {
@@ -469,8 +470,8 @@ export default async function (pi: ExtensionAPI) {
 
     // Fetch and display credits balance
     try {
-      const balance = await fetchKiloBalance(cred.access);
-      if (balance !== null) {
+      const balance = await fetchKiloBalance(token);
+      if (balance !== null && ctx.model?.provider === "kilo") {
         const theme = ctx.ui.theme;
         ctx.ui.setStatus(
           "kilo-credits",
@@ -485,16 +486,22 @@ export default async function (pi: ExtensionAPI) {
     }
   });
 
-  // Update credits display when model changes to a Kilo model
+  // Update or clear credits when the active model changes.
   pi.on("model_select", async (event, ctx) => {
-    if (event.model?.provider !== "kilo") return;
+    if (event.model?.provider !== "kilo") {
+      ctx.ui.setStatus("kilo-credits", undefined);
+      return;
+    }
 
     const token = await getKiloOAuthToken(ctx);
-    if (!token) return;
+    if (!token) {
+      ctx.ui.setStatus("kilo-credits", undefined);
+      return;
+    }
 
     try {
       const balance = await fetchKiloBalance(token);
-      if (balance !== null) {
+      if (balance !== null && ctx.model?.provider === "kilo") {
         const theme = ctx.ui.theme;
         ctx.ui.setStatus(
           "kilo-credits",
@@ -509,14 +516,22 @@ export default async function (pi: ExtensionAPI) {
     }
   });
 
-  // Refresh credits after each turn
+  // Refresh credits after each turn while a Kilo model is active.
   pi.on("turn_end", async (_event, ctx) => {
+    if (ctx.model?.provider !== "kilo") {
+      ctx.ui.setStatus("kilo-credits", undefined);
+      return;
+    }
+
     const token = await getKiloOAuthToken(ctx);
-    if (!token) return;
+    if (!token) {
+      ctx.ui.setStatus("kilo-credits", undefined);
+      return;
+    }
 
     try {
       const balance = await fetchKiloBalance(token);
-      if (balance !== null) {
+      if (balance !== null && ctx.model?.provider === "kilo") {
         const theme = ctx.ui.theme;
         ctx.ui.setStatus(
           "kilo-credits",
