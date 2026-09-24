@@ -9,14 +9,18 @@
  *   # Then /login kilo, or set KILO_API_KEY=...
  */
 
+import {
+  createProvider,
+  type Credential,
+  type Model,
+  openAICompletionsApi,
+  type OAuthCredential,
+  type ProviderAuthInteraction,
+} from "@earendil-works/pi-ai/compat";
 import type {
-  Api,
-  Model,
-  OAuthCredentials,
-  OAuthLoginCallbacks,
-} from "@mariozechner/pi-ai";
-import type { ExtensionAPI, ProviderModelConfig } from "@mariozechner/pi-coding-agent";
-import { visibleWidth } from "@mariozechner/pi-tui";
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 
 // =============================================================================
 // Constants
@@ -28,6 +32,7 @@ const KILO_DEVICE_AUTH_ENDPOINT = `${KILO_API_BASE}/api/device-auth/codes`;
 const POLL_INTERVAL_MS = 3000;
 const MODELS_FETCH_TIMEOUT_MS = 10_000;
 const TOKEN_EXPIRATION_MS = 365 * 24 * 60 * 60 * 1000; // 1 year
+const KILO_FREE_API_KEY = "kilo-free";
 const KILO_TOS_URL = "https://kilo.ai/terms";
 const KILO_PROFILE_ENDPOINT = `${KILO_API_BASE}/api/profile`;
 
@@ -101,10 +106,11 @@ function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-async function initiateDeviceAuth(): Promise<DeviceAuthResponse> {
+async function initiateDeviceAuth(signal: AbortSignal): Promise<DeviceAuthResponse> {
   const response = await fetch(KILO_DEVICE_AUTH_ENDPOINT, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    signal,
   });
 
   if (!response.ok) {
@@ -121,8 +127,13 @@ async function initiateDeviceAuth(): Promise<DeviceAuthResponse> {
   return (await response.json()) as DeviceAuthResponse;
 }
 
-async function pollDeviceAuth(code: string): Promise<DeviceAuthPollResponse> {
-  const response = await fetch(`${KILO_DEVICE_AUTH_ENDPOINT}/${code}`);
+async function pollDeviceAuth(
+  code: string,
+  signal: AbortSignal,
+): Promise<DeviceAuthPollResponse> {
+  const response = await fetch(`${KILO_DEVICE_AUTH_ENDPOINT}/${code}`, {
+    signal,
+  });
 
   if (response.status === 202) return { status: "pending" };
   if (response.status === 403) return { status: "denied" };
@@ -136,35 +147,41 @@ async function pollDeviceAuth(code: string): Promise<DeviceAuthPollResponse> {
 }
 
 async function loginKilo(
-  callbacks: OAuthLoginCallbacks,
-): Promise<OAuthCredentials> {
-  callbacks.onProgress?.("Initiating device authorization...");
-  const authData = await initiateDeviceAuth();
+  interaction: ProviderAuthInteraction,
+): Promise<OAuthCredential> {
+  interaction.notify({
+    type: "progress",
+    message: "Initiating device authorization...",
+  });
+  const authData = await initiateDeviceAuth(interaction.signal);
   const { code, verificationUrl, expiresIn } = authData;
 
-  callbacks.onAuth({
-    url: verificationUrl,
-    instructions: `Enter code: ${code}`,
+  interaction.notify({
+    type: "device_code",
+    userCode: code,
+    verificationUri: verificationUrl,
+    intervalSeconds: POLL_INTERVAL_MS / 1000,
+    expiresInSeconds: expiresIn,
   });
-
-  callbacks.onProgress?.("Waiting for browser authorization...");
+  interaction.notify({
+    type: "progress",
+    message: "Waiting for browser authorization...",
+  });
 
   const deadline = Date.now() + expiresIn * 1000;
   while (Date.now() < deadline) {
-    if (callbacks.signal?.aborted) {
-      throw new Error("Login cancelled");
-    }
+    interaction.signal.throwIfAborted();
+    await abortableSleep(POLL_INTERVAL_MS, interaction.signal);
 
-    await abortableSleep(POLL_INTERVAL_MS, callbacks.signal);
-
-    const result = await pollDeviceAuth(code);
+    const result = await pollDeviceAuth(code, interaction.signal);
 
     if (result.status === "approved") {
       if (!result.token) {
         throw new Error("Authorization approved but no token received");
       }
-      callbacks.onProgress?.("Login successful!");
+      interaction.notify({ type: "progress", message: "Login successful!" });
       return {
+        type: "oauth",
         refresh: result.token,
         access: result.token,
         expires: Date.now() + TOKEN_EXPIRATION_MS,
@@ -180,17 +197,20 @@ async function loginKilo(
     }
 
     const remaining = Math.ceil((deadline - Date.now()) / 1000);
-    callbacks.onProgress?.(
-      `Waiting for browser authorization... (${remaining}s remaining)`,
-    );
+    interaction.notify({
+      type: "progress",
+      message: `Waiting for browser authorization... (${remaining}s remaining)`,
+    });
   }
 
   throw new Error("Authentication timed out. Please try again.");
 }
 
 async function refreshKiloToken(
-  credentials: OAuthCredentials,
-): Promise<OAuthCredentials> {
+  credentials: OAuthCredential,
+  signal: AbortSignal,
+): Promise<OAuthCredential> {
+  signal.throwIfAborted();
   if (credentials.expires > Date.now()) {
     return credentials;
   }
@@ -230,31 +250,29 @@ function parsePrice(price: string | null | undefined): number {
   return parsed * 1_000_000;
 }
 
-function isFreeModel(m: OpenRouterModel): boolean {
-  const prompt = parseFloat(m.pricing?.prompt ?? "1");
-  const completion = parseFloat(m.pricing?.completion ?? "1");
-  if (prompt !== 0 || completion !== 0) return false;
+function isKnownFreeModelId(id: string): boolean {
   // Zero pricing alone isn't reliable (some models report "0" but require auth).
   // Use the :free suffix (OpenRouter convention), Kilo-native models (no vendor
   // prefix), or known Kilo/OpenRouter free routers.
-  if (m.id === "kilo-auto/free") return true;
-  if (m.id.includes(":free")) return true;
-  if (!m.id.includes("/")) return true;
-  if (m.id.startsWith("kilo/") || m.id.startsWith("openrouter/")) return true;
-  return false;
+  return (
+    id === "kilo-auto/free" ||
+    id.includes(":free") ||
+    !id.includes("/") ||
+    id.startsWith("kilo/") ||
+    id.startsWith("openrouter/")
+  );
 }
 
-type KiloReasoningLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
+function isFreeModel(m: OpenRouterModel): boolean {
+  const prompt = parseFloat(m.pricing?.prompt ?? "1");
+  const completion = parseFloat(m.pricing?.completion ?? "1");
+  return prompt === 0 && completion === 0 && isKnownFreeModelId(m.id);
+}
 
-type KiloModelCompat = {
-  cacheControlFormat?: "anthropic";
-  requiresReasoningContentOnAssistantMessages?: boolean;
-  reasoningEffortMap?: Partial<Record<KiloReasoningLevel, string>>;
-};
+type KiloModel = Model<"openai-completions">;
+type KiloModelCompat = NonNullable<KiloModel["compat"]>;
 
-function getKiloModelCompat(
-  m: OpenRouterModel,
-): ProviderModelConfig["compat"] | undefined {
+function getKiloModelCompat(m: OpenRouterModel): KiloModel["compat"] {
   const compat: KiloModelCompat = {};
 
   // Kilo's gateway is OpenRouter-compatible, but it uses api.kilo.ai so
@@ -267,16 +285,10 @@ function getKiloModelCompat(
     compat.requiresReasoningContentOnAssistantMessages = true;
   }
 
-  if (m.id === "deepseek/deepseek-v4-pro") {
-    compat.reasoningEffortMap = { xhigh: "max" };
-  }
-
-  return Object.keys(compat).length > 0
-    ? (compat as ProviderModelConfig["compat"])
-    : undefined;
+  return Object.keys(compat).length > 0 ? compat : undefined;
 }
 
-function mapOpenRouterModel(m: OpenRouterModel): ProviderModelConfig {
+function mapOpenRouterModel(m: OpenRouterModel): KiloModel {
   const inputModalities = m.architecture?.input_modalities ?? ["text"];
   const supportsImages = inputModalities.includes("image");
   const supportsReasoning =
@@ -289,7 +301,12 @@ function mapOpenRouterModel(m: OpenRouterModel): ProviderModelConfig {
   return {
     id: m.id,
     name: m.name,
+    api: "openai-completions",
+    provider: "kilo",
+    baseUrl: KILO_GATEWAY_BASE,
     reasoning: supportsReasoning,
+    thinkingLevelMap:
+      m.id === "deepseek/deepseek-v4-pro" ? { xhigh: "max" } : undefined,
     input: supportsImages ? ["text", "image"] : ["text"],
     cost: {
       input: parsePrice(m.pricing?.prompt),
@@ -306,7 +323,8 @@ function mapOpenRouterModel(m: OpenRouterModel): ProviderModelConfig {
 async function fetchKiloModels(options?: {
   token?: string;
   freeOnly?: boolean;
-}): Promise<ProviderModelConfig[]> {
+  signal?: AbortSignal;
+}): Promise<KiloModel[]> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "User-Agent": "pi-kilo-provider",
@@ -315,9 +333,13 @@ async function fetchKiloModels(options?: {
     headers.Authorization = `Bearer ${options.token}`;
   }
 
+  const timeoutSignal = AbortSignal.timeout(MODELS_FETCH_TIMEOUT_MS);
+  const signal = options?.signal
+    ? AbortSignal.any([options.signal, timeoutSignal])
+    : timeoutSignal;
   const response = await fetch(`${KILO_GATEWAY_BASE}/models`, {
     headers,
-    signal: AbortSignal.timeout(MODELS_FETCH_TIMEOUT_MS),
+    signal,
   });
 
   if (!response.ok) {
@@ -344,182 +366,178 @@ async function fetchKiloModels(options?: {
 }
 
 // =============================================================================
-// Provider Config
+// Provider
 // =============================================================================
 
-const KILO_PROVIDER_CONFIG = {
-  baseUrl: KILO_GATEWAY_BASE,
-  apiKey: "KILO_API_KEY",
-  api: "openai-completions" as const,
-  headers: {
-    "X-KILOCODE-EDITORNAME": "Pi",
-    "User-Agent": "pi-kilo-provider",
-  },
-};
+function getCredentialToken(
+  credential: Credential | undefined,
+): string | undefined {
+  if (credential?.type === "oauth") return credential.access;
+  return credential?.key === KILO_FREE_API_KEY ? undefined : credential?.key;
+}
+
+function createKiloProvider(initialModels: KiloModel[]) {
+  const openAI = openAICompletionsApi();
+  const withoutFreePlaceholder = <
+    T extends {
+      apiKey?: string;
+      headers?: Record<string, string | null>;
+    },
+  >(
+    options: T | undefined,
+  ): T | undefined => {
+    if (options?.apiKey !== KILO_FREE_API_KEY) return options;
+    return {
+      ...options,
+      apiKey: "unused",
+      // A null request header suppresses the OpenAI SDK's generated bearer
+      // header while retaining a non-empty internal key for client creation.
+      headers: { ...options.headers, Authorization: null },
+    };
+  };
+
+  return createProvider({
+    id: "kilo",
+    name: "Kilo",
+    baseUrl: KILO_GATEWAY_BASE,
+    headers: {
+      "X-KILOCODE-EDITORNAME": "Pi",
+      "User-Agent": "pi-kilo-provider",
+    },
+    auth: {
+      // Kilo's free catalog is usable without credentials, so this auth method
+      // deliberately resolves even when KILO_API_KEY is unset.
+      apiKey: {
+        name: "Kilo API key",
+        async check({ ctx, credential }) {
+          const key = credential?.key ?? (await ctx.env("KILO_API_KEY"));
+          return {
+            type: "api_key",
+            source: key ? "KILO_API_KEY" : "Kilo free access",
+          };
+        },
+        async resolve({ ctx, credential }) {
+          const key = credential?.key ?? (await ctx.env("KILO_API_KEY"));
+          return {
+            // Pi requires a non-empty key to mark the provider available. The
+            // stream wrapper strips this sentinel before free-model requests.
+            auth: { apiKey: key ?? KILO_FREE_API_KEY },
+            source: key ? "KILO_API_KEY" : "Kilo free access",
+          };
+        },
+      },
+      oauth: {
+        name: "Kilo",
+        login: loginKilo,
+        refresh: refreshKiloToken,
+        async toAuth(credential) {
+          return { apiKey: credential.access };
+        },
+      },
+    },
+    models: initialModels,
+    async fetchModels(context) {
+      const token = getCredentialToken(context.credential);
+      return fetchKiloModels({
+        token,
+        freeOnly: !token,
+        signal: context.signal,
+      });
+    },
+    // Never expose a persisted authenticated catalog after logout/offline
+    // startup unless a real API key or OAuth token is currently configured.
+    filterModels(models, credential) {
+      if (getCredentialToken(credential)) return models;
+      return models.filter(
+        (model) =>
+          model.cost.input === 0 &&
+          model.cost.output === 0 &&
+          isKnownFreeModelId(model.id),
+      );
+    },
+    api: {
+      stream(model, context, options) {
+        return openAI.stream(model, context, withoutFreePlaceholder(options));
+      },
+      streamSimple(model, context, options) {
+        return openAI.streamSimple(
+          model,
+          context,
+          withoutFreePlaceholder(options),
+        );
+      },
+    },
+  });
+}
 
 // =============================================================================
 // Extension Entry Point
 // =============================================================================
 
-export default async function (pi: ExtensionAPI) {
-  // Fetch free models at load time so the provider is immediately usable.
-  let freeModels: ProviderModelConfig[] = [];
+async function updateKiloCredits(ctx: ExtensionContext): Promise<void> {
+  if (ctx.model?.provider !== "kilo") {
+    ctx.ui.setStatus("kilo-credits", undefined);
+    return;
+  }
+
   try {
-    freeModels = await fetchKiloModels({ freeOnly: true });
-  } catch (error) {
-    console.warn(
-      "[kilo] Failed to fetch free models at startup:",
-      error instanceof Error ? error.message : error,
-    );
-  }
-
-  // Full model list cached after login or session_start (when already logged in).
-  // Used by modifyModels to upgrade the free list without an async fetch.
-  let cachedAllModels: ProviderModelConfig[] = [];
-
-  function makeOAuthConfig() {
-    return {
-      name: "Kilo",
-      login: async (callbacks: OAuthLoginCallbacks) => {
-        const cred = await loginKilo(callbacks);
-        // Cache full models so modifyModels can use them during the
-        // modelRegistry.refresh() that runs right after login returns.
-        try {
-          cachedAllModels = await fetchKiloModels({ token: cred.access });
-        } catch (error) {
-          console.warn(
-            "[kilo] Failed to fetch models after login:",
-            error instanceof Error ? error.message : error,
-          );
-        }
-        return cred;
-      },
-      refreshToken: refreshKiloToken,
-      getApiKey: (cred: OAuthCredentials) => cred.access,
-      // Called by modelRegistry.refresh() when credentials exist.
-      // After logout, credentials are removed so this won't be called,
-      // leaving only the free models from config.models.
-      modifyModels: (models: Model<Api>[], _cred: OAuthCredentials) => {
-        if (cachedAllModels.length === 0) return models;
-        // Use an existing kilo model as a template for provider metadata
-        const template = models.find((m) => m.provider === "kilo");
-        if (!template) return models;
-        const nonKilo = models.filter((m) => m.provider !== "kilo");
-        const fullModels = cachedAllModels.map((m) => ({
-          ...template,
-          id: m.id,
-          name: m.name,
-          reasoning: m.reasoning,
-          input: m.input,
-          cost: m.cost,
-          contextWindow: m.contextWindow,
-          maxTokens: m.maxTokens,
-          compat: m.compat,
-        }));
-        return [...nonKilo, ...fullModels];
-      },
-    };
-  }
-
-  // Always register with free models. modifyModels upgrades to full list
-  // when credentials exist, and naturally falls back after logout.
-  pi.registerProvider("kilo", {
-    ...KILO_PROVIDER_CONFIG,
-    models: freeModels,
-    oauth: makeOAuthConfig(),
-  });
-
-  // After session starts, pre-fetch all models if already logged in so
-  // modifyModels has data to work with. Also fetch and display credits.
-  pi.on("session_start", async (_event, ctx) => {
-    const cred = ctx.modelRegistry.authStorage.get("kilo");
-
-    // Clear credits if not logged in
-    if (cred?.type !== "oauth") {
+    const auth = await ctx.modelRegistry.getProviderAuth("kilo");
+    const token = auth?.auth.apiKey;
+    if (!token || token === KILO_FREE_API_KEY) {
       ctx.ui.setStatus("kilo-credits", undefined);
       return;
     }
 
-    try {
-      cachedAllModels = await fetchKiloModels({ token: cred.access });
-    } catch (error) {
-      console.warn(
-        "[kilo] Failed to fetch models at session start:",
-        error instanceof Error ? error.message : error,
-      );
-      return;
-    }
-    if (cachedAllModels.length > 0) {
-      // Re-register to trigger modifyModels with the cached data.
-      ctx.modelRegistry.registerProvider("kilo", {
-        ...KILO_PROVIDER_CONFIG,
-        models: freeModels,
-        oauth: makeOAuthConfig(),
-      });
-    }
+    const balance = await fetchKiloBalance(token);
+    ctx.ui.setStatus(
+      "kilo-credits",
+      balance === null
+        ? undefined
+        : ctx.ui.theme.fg("accent", `💰 ${formatCredits(balance)}`),
+    );
+  } catch (error) {
+    ctx.ui.setStatus("kilo-credits", undefined);
+    console.warn(
+      "[kilo] Failed to fetch balance:",
+      error instanceof Error ? error.message : error,
+    );
+  }
+}
 
-    // Fetch and display credits balance
+export default async function (pi: ExtensionAPI) {
+  let initialModels: KiloModel[] = [];
+  if (process.env.PI_OFFLINE !== "1") {
     try {
-      const balance = await fetchKiloBalance(cred.access);
-      if (balance !== null) {
-        const theme = ctx.ui.theme;
-        ctx.ui.setStatus(
-          "kilo-credits",
-          theme.fg("accent", `💰 ${formatCredits(balance)}`),
-        );
-      }
+      const token = process.env.KILO_API_KEY;
+      initialModels = await fetchKiloModels({ token, freeOnly: !token });
     } catch (error) {
       console.warn(
-        "[kilo] Failed to fetch balance:",
+        "[kilo] Failed to fetch models at startup:",
         error instanceof Error ? error.message : error,
       );
     }
+  }
+
+  pi.registerProvider(createKiloProvider(initialModels));
+
+  pi.on("session_start", async (_event, ctx) => {
+    const result = await ctx.modelRegistry.refresh({
+      providers: ["kilo"],
+      allowNetwork: process.env.PI_OFFLINE !== "1",
+    });
+    const refreshError = result.errors.get("kilo");
+    if (refreshError) {
+      console.warn("[kilo] Failed to refresh models:", refreshError.message);
+    }
+    await updateKiloCredits(ctx);
   });
 
-  // Update credits display when model changes to a Kilo model
-  pi.on("model_select", async (event, ctx) => {
-    if (event.model?.provider !== "kilo") return;
-
-    const cred = ctx.modelRegistry.authStorage.get("kilo");
-    if (cred?.type !== "oauth") return;
-
-    try {
-      const balance = await fetchKiloBalance(cred.access);
-      if (balance !== null) {
-        const theme = ctx.ui.theme;
-        ctx.ui.setStatus(
-          "kilo-credits",
-          theme.fg("accent", `💰 ${formatCredits(balance)}`),
-        );
-      }
-    } catch (error) {
-      console.warn(
-        "[kilo] Failed to fetch balance on model select:",
-        error instanceof Error ? error.message : error,
-      );
-    }
+  pi.on("model_select", async (_event, ctx) => {
+    await updateKiloCredits(ctx);
   });
 
-  // Refresh credits after each turn
   pi.on("turn_end", async (_event, ctx) => {
-    const cred = ctx.modelRegistry.authStorage.get("kilo");
-    if (cred?.type !== "oauth") return;
-
-    try {
-      const balance = await fetchKiloBalance(cred.access);
-      if (balance !== null) {
-        const theme = ctx.ui.theme;
-        ctx.ui.setStatus(
-          "kilo-credits",
-          theme.fg("accent", `💰 ${formatCredits(balance)}`),
-        );
-      }
-    } catch (error) {
-      console.warn(
-        "[kilo] Failed to fetch balance on turn end:",
-        error instanceof Error ? error.message : error,
-      );
-    }
+    await updateKiloCredits(ctx);
   });
 
   // On first use of a Kilo model without login, print ToS notice.
@@ -529,8 +547,8 @@ export default async function (pi: ExtensionAPI) {
     if (tosShown) return;
     if (ctx.model?.provider !== "kilo") return;
 
-    const cred = ctx.modelRegistry.authStorage.get("kilo");
-    if (cred?.type === "oauth") {
+    const auth = await ctx.modelRegistry.getProviderAuth("kilo");
+    if (auth?.auth.apiKey && auth.auth.apiKey !== KILO_FREE_API_KEY) {
       tosShown = true;
       return;
     }
@@ -544,163 +562,5 @@ export default async function (pi: ExtensionAPI) {
         display: true,
       },
     };
-  });
-
-  // Use custom footer to show credits inline with token stats
-  pi.on("session_start", async (_event, ctx) => {
-    ctx.ui.setFooter((tui, theme, footerData) => {
-      const unsubBranch = footerData.onBranchChange(() => tui.requestRender());
-
-      const formatTokens = (count: number): string => {
-        if (count < 1000) return count.toString();
-        if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-        if (count < 1000000) return `${Math.round(count / 1000)}k`;
-        if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
-        return `${Math.round(count / 1000000)}M`;
-      };
-
-      return {
-        dispose() {
-          unsubBranch();
-        },
-        invalidate() {},
-        render(width: number): string[] {
-          const model = ctx.model;
-
-          // Match built-in footer totals: all assistant messages across all entries
-          let totalInput = 0;
-          let totalOutput = 0;
-          let totalCacheRead = 0;
-          let totalCacheWrite = 0;
-          let totalCost = 0;
-          for (const entry of ctx.sessionManager.getEntries()) {
-            if (entry.type === "message" && entry.message.role === "assistant") {
-              totalInput += entry.message.usage.input;
-              totalOutput += entry.message.usage.output;
-              totalCacheRead += entry.message.usage.cacheRead;
-              totalCacheWrite += entry.message.usage.cacheWrite;
-              totalCost += entry.message.usage.cost.total;
-            }
-          }
-
-          // Match built-in context usage behavior
-          const contextUsage = ctx.getContextUsage();
-          const contextWindow = contextUsage?.contextWindow ?? model?.contextWindow ?? 0;
-          const contextPercentValue = contextUsage?.percent ?? 0;
-          const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
-
-          // Build pwd line like built-in (path + branch + session name)
-          let pwd = process.cwd();
-          const home = process.env.HOME || process.env.USERPROFILE;
-          if (home && pwd.startsWith(home)) pwd = `~${pwd.slice(home.length)}`;
-          const branch = footerData.getGitBranch();
-          if (branch) pwd = `${pwd} (${branch})`;
-          const sessionName = ctx.sessionManager.getSessionName();
-          if (sessionName) pwd = `${pwd} • ${sessionName}`;
-
-          if (pwd.length > width) {
-            const half = Math.floor(width / 2) - 2;
-            if (half > 1) {
-              pwd = `${pwd.slice(0, half)}...${pwd.slice(-(half - 1))}`;
-            } else {
-              pwd = pwd.slice(0, Math.max(1, width));
-            }
-          }
-
-          const statsParts: string[] = [];
-          if (totalInput) statsParts.push(`↑${formatTokens(totalInput)}`);
-          if (totalOutput) statsParts.push(`↓${formatTokens(totalOutput)}`);
-          if (totalCacheRead) statsParts.push(`R${formatTokens(totalCacheRead)}`);
-          if (totalCacheWrite) statsParts.push(`W${formatTokens(totalCacheWrite)}`);
-
-          const usingSubscription = model ? ctx.modelRegistry.isUsingOAuth(model) : false;
-          if (totalCost || usingSubscription) {
-            statsParts.push(`$${totalCost.toFixed(3)}${usingSubscription ? " (sub)" : ""}`);
-          }
-
-          const autoIndicator = " (auto)";
-          const contextPercentDisplay =
-            contextPercent === "?"
-              ? `?/${formatTokens(contextWindow)}${autoIndicator}`
-              : `${contextPercent}%/${formatTokens(contextWindow)}${autoIndicator}`;
-
-          let contextPercentStr: string;
-          if (contextPercentValue > 90) {
-            contextPercentStr = theme.fg("error", contextPercentDisplay);
-          } else if (contextPercentValue > 70) {
-            contextPercentStr = theme.fg("warning", contextPercentDisplay);
-          } else {
-            contextPercentStr = contextPercentDisplay;
-          }
-          statsParts.push(contextPercentStr);
-
-          // Inject extension statuses inline on the main stats line.
-          // Kilo's credits keep their existing position, then any statuses from
-          // other extensions are appended in the same deterministic order used
-          // by Pi's built-in footer.
-          const extensionStatuses = footerData.getExtensionStatuses();
-          const creditsStatus = extensionStatuses.get("kilo-credits");
-          if (creditsStatus) statsParts.push(creditsStatus);
-
-          const otherStatuses = Array.from(extensionStatuses.entries())
-            .filter(([key]) => key !== "kilo-credits")
-            .sort(([a], [b]) => a.localeCompare(b))
-            .map(([, text]) => text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim())
-            .filter((text) => text.length > 0);
-          statsParts.push(...otherStatuses);
-
-          let statsLeft = statsParts.join(" ");
-          let statsLeftWidth = visibleWidth(statsLeft);
-
-          // Right side: model + thinking + provider like built-in
-          const modelName = model?.id || "no-model";
-          let rightSideWithoutProvider = modelName;
-          if (model?.reasoning) {
-            const thinkingLevel = pi.getThinkingLevel() || "off";
-            rightSideWithoutProvider =
-              thinkingLevel === "off" ? `${modelName} • thinking off` : `${modelName} • ${thinkingLevel}`;
-          }
-
-          let rightSide = rightSideWithoutProvider;
-          if (footerData.getAvailableProviderCount() > 1 && model) {
-            rightSide = `(${model.provider}) ${rightSideWithoutProvider}`;
-            if (statsLeftWidth + 2 + visibleWidth(rightSide) > width) {
-              rightSide = rightSideWithoutProvider;
-            }
-          }
-
-          if (statsLeftWidth > width) {
-            const plainStatsLeft = statsLeft.replace(/\x1b\[[0-9;]*m/g, "");
-            statsLeft = `${plainStatsLeft.substring(0, width - 3)}...`;
-            statsLeftWidth = visibleWidth(statsLeft);
-          }
-
-          const rightSideWidth = visibleWidth(rightSide);
-          const totalNeeded = statsLeftWidth + 2 + rightSideWidth;
-
-          let statsLine: string;
-          if (totalNeeded <= width) {
-            const padding = " ".repeat(width - statsLeftWidth - rightSideWidth);
-            statsLine = statsLeft + padding + rightSide;
-          } else {
-            const availableForRight = width - statsLeftWidth - 2;
-            if (availableForRight > 3) {
-              const plainRight = rightSide.replace(/\x1b\[[0-9;]*m/g, "");
-              const truncatedRight = plainRight.substring(0, availableForRight);
-              const padding = " ".repeat(width - statsLeftWidth - truncatedRight.length);
-              statsLine = statsLeft + padding + truncatedRight;
-            } else {
-              statsLine = statsLeft;
-            }
-          }
-
-          const dimStatsLeft = theme.fg("dim", statsLeft);
-          const remainder = statsLine.slice(statsLeft.length);
-          const dimRemainder = theme.fg("dim", remainder);
-
-          return [theme.fg("dim", pwd), dimStatsLeft + dimRemainder];
-        },
-      };
-    });
   });
 }

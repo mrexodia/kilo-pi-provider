@@ -14,5 +14,9 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/mrexodia/kilo-pi-provider.git"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
   }
 }

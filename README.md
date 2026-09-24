@@ -7,7 +7,7 @@ Kilo provider extension for Pi. Access 300+ AI models through the Kilo Gateway.
 Install [Pi](https://pi.dev) (the coding agent CLI):
 
 ```bash
-npm install -g @mariozechner/pi-coding-agent
+npm install -g @earendil-works/pi-coding-agent
 ```
 
 ## Installation
@@ -32,4 +32,4 @@ Free models are available immediately. To access all models, log in with your [K
 
 This opens your browser for device authorization. Once approved, all models become available in the model selector (`Ctrl+L`).
 
-You can also set the `KILO_API_KEY` environment variable directly instead of using the login flow.
+You can also set the `KILO_API_KEY` environment variable directly instead of using the login flow. Without credentials, Pi only shows Kilo's free models.
